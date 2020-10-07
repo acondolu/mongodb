@@ -205,7 +205,7 @@ primary :: ReplicaSet -> IO Pipe
 primary rs@(ReplicaSet rsName _ _ _) = do
     mHost <- statedPrimary <$> updateMembers rs
     case mHost of
-        Just host' -> connection rs Nothing host'
+        Just host' -> connectionNew rs host'
         Nothing -> throwError $ userError $ "replica set " ++ T.unpack rsName ++ " has no primary"
 
 secondaryOk :: ReplicaSet -> IO Pipe
@@ -214,7 +214,7 @@ secondaryOk rs = do
     info <- updateMembers rs
     hosts <- shuffle (possibleHosts info)
     let hosts' = maybe hosts (\p -> delete p hosts ++ [p]) (statedPrimary info)
-    untilSuccess (connection rs Nothing) hosts'
+    untilSuccess (connectionNew rs) hosts'
 
 routedHost :: ((Host, Bool) -> (Host, Bool) -> IO Ordering) -> ReplicaSet -> IO Pipe
 -- ^ Return a connection to a host using a user-supplied sorting function, which sorts based on a tuple containing the host and a boolean indicating whether the host is primary.
@@ -223,7 +223,7 @@ routedHost f rs = do
   hosts <- shuffle (possibleHosts info)
   let addIsPrimary h = (h, if Just h == statedPrimary info then True else False)
   hosts' <- mergesortM (\a b -> f (addIsPrimary a) (addIsPrimary b)) hosts
-  untilSuccess (connection rs Nothing) hosts'
+  untilSuccess (connectionNew rs) hosts'
 
 type ReplicaInfo = (Host, Document)
 -- ^ Result of isMaster command on host in replica set. Returned fields are: setName, ismaster, secondary, hosts, [primary]. primary only present when ismaster = false
@@ -238,9 +238,9 @@ possibleHosts (_, info) = map readHostPort $ at "hosts" info
 
 updateMembers :: ReplicaSet -> IO ReplicaInfo
 -- ^ Fetch replica info from any server and update members accordingly
-updateMembers rs@(ReplicaSet _ vMembers _ _) = do
-    (host', info) <- untilSuccess (fetchReplicaInfo rs) =<< readMVar vMembers
+updateMembers rs@(ReplicaSet _ vMembers _ _) =
     modifyMVar vMembers $ \members -> do
+        (host', info) <- untilSuccess (fetchReplicaInfo rs) =<< readMVar vMembers
         let ((members', old), new) = intersection (map readHostPort $ at "hosts" info) members
         forM_ old $ \(_, mPipe) -> maybe (return ()) close mPipe
         return (members' ++ map (, Nothing) new, (host', info))
@@ -275,6 +275,10 @@ connection (ReplicaSet _ vMembers timeoutSecs transportSecurity) mPipe host' =
             Just (Just pipe) -> isClosed pipe >>= \bad -> if bad then new else return (members, pipe)
             _ -> new
 
+connectionNew :: ReplicaSet -> Host -> IO Pipe
+-- ^ Return a new connection to given host.
+connectionNew (ReplicaSet _ _ _ Secure) (Host h p) = TLS.connect h p
+connectionNew (ReplicaSet _ _ timeoutSecs Unsecure) host' = connect' timeoutSecs host'
 
 {- Authors: Tony Hannan <tony@10gen.com>
    Copyright 2011 10gen Inc.
