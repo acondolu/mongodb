@@ -24,14 +24,13 @@ module Database.MongoDB.Connection (
 
 import Prelude hiding (lookup)
 import Data.IORef (IORef, newIORef, readIORef)
-import Data.List (intersect, partition, (\\), delete)
 import Data.Maybe (fromJust)
 
 #if !MIN_VERSION_base(4,8,0)
 import Control.Applicative ((<$>))
 #endif
 
-import Control.Monad (forM_, guard)
+import Control.Monad (guard)
 import Control.Monad.Fail(MonadFail)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Timeout (timeout)
@@ -40,10 +39,8 @@ import Text.ParserCombinators.Parsec (parse, many1, letter, digit, char, anyChar
 import qualified Data.List as List
 
 
-import Control.Monad.Identity (runIdentity)
 import Control.Monad.Except (throwError)
-import Control.Concurrent.MVar.Lifted (MVar, newMVar, withMVar, modifyMVar,
-                                       readMVar)
+import Control.Concurrent.MVar.Lifted (MVar, newMVar, modifyMVar, readMVar)
 import Data.Bson (Document, at, (=:))
 import Data.Text (Text)
 
@@ -53,7 +50,7 @@ import qualified Data.Text as T
 import Database.MongoDB.Internal.Network (Host(..), HostName, PortID(..), connectTo, lookupSeedList, lookupReplicaSetName)
 import Database.MongoDB.Internal.Protocol (Pipe, newPipe, close, isClosed)
 import Database.MongoDB.Internal.Util (untilSuccess, liftIOE,
-                                       updateAssocs, shuffle, mergesortM)
+                                       shuffle, mergesortM)
 import Database.MongoDB.Query (Command, Failure(ConnectionFailure), access,
                               slaveOk, runCommand, retrieveServerData)
 import qualified Database.MongoDB.Transport.Tls as TLS (connect)
@@ -135,7 +132,7 @@ type ReplicaSetName = Text
 data TransportSecurity = Secure | Unsecure
 
 -- | Maintains a connection (created on demand) to each server in the named replica set
-data ReplicaSet = ReplicaSet ReplicaSetName (MVar [(Host, Maybe Pipe)]) Secs TransportSecurity
+data ReplicaSet = ReplicaSet ReplicaSetName (MVar [Host]) Secs TransportSecurity
 
 replSetName :: ReplicaSet -> Text
 -- ^ Get the name of connected replica set.
@@ -159,7 +156,7 @@ openReplicaSetTLS' timeoutSecs (rs, hosts) = _openReplicaSet timeoutSecs (rs, ho
 
 _openReplicaSet :: Secs -> (ReplicaSetName, [Host], TransportSecurity) -> IO ReplicaSet
 _openReplicaSet timeoutSecs (rsName, seedList, transportSecurity) = do 
-    vMembers <- newMVar (map (, Nothing) seedList)
+    vMembers <- newMVar seedList
     let rs = ReplicaSet rsName vMembers timeoutSecs transportSecurity
     _ <- updateMembers rs
     return rs
@@ -198,39 +195,40 @@ _openReplicaSetSRV timeoutSecs transportSecurity hostname = do
 
 closeReplicaSet :: ReplicaSet -> IO ()
 -- ^ Close all connections to replica set
-closeReplicaSet (ReplicaSet _ vMembers _ _) = withMVar vMembers $ mapM_ (maybe (return ()) close . snd)
+{-# DEPRECATED closeReplicaSet "It is not necessary to close a replica set anymore" #-}
+closeReplicaSet _ = pure ()
 
 primary :: ReplicaSet -> IO Pipe
 -- ^ Return connection to current primary of replica set. Fail if no primary available.
 primary rs@(ReplicaSet rsName _ _ _) = do
-    mHost <- statedPrimary <$> updateMembers rs
-    case mHost of
-        Just host' -> connection rs Nothing host'
+    rsinfo@(cachedConn, _) <- updateMembers rs
+    case statedPrimary rsinfo of
+        Just host' -> connection rs (Just cachedConn) host'
         Nothing -> throwError $ userError $ "replica set " ++ T.unpack rsName ++ " has no primary"
 
 secondaryOk :: ReplicaSet -> IO Pipe
 -- ^ Return connection to a random secondary, or primary if no secondaries available.
 secondaryOk rs = do
-    info <- updateMembers rs
-    hosts <- shuffle (possibleHosts info)
-    let hosts' = maybe hosts (\p -> delete p hosts ++ [p]) (statedPrimary info)
-    untilSuccess (connection rs Nothing) hosts'
+    rsinfo@(cachedConn, _) <- updateMembers rs
+    hosts <- shuffle (possibleHosts rsinfo)
+    let hosts' = maybe hosts (\p -> List.delete p hosts ++ [p]) (statedPrimary rsinfo)
+    untilSuccess (connection rs (Just cachedConn)) hosts'
 
 routedHost :: ((Host, Bool) -> (Host, Bool) -> IO Ordering) -> ReplicaSet -> IO Pipe
 -- ^ Return a connection to a host using a user-supplied sorting function, which sorts based on a tuple containing the host and a boolean indicating whether the host is primary.
 routedHost f rs = do
-  info <- updateMembers rs
-  hosts <- shuffle (possibleHosts info)
-  let addIsPrimary h = (h, if Just h == statedPrimary info then True else False)
+  rsinfo@(cachedConn, _) <- updateMembers rs
+  hosts <- shuffle (possibleHosts rsinfo)
+  let addIsPrimary h = (h, if Just h == statedPrimary rsinfo then True else False)
   hosts' <- mergesortM (\a b -> f (addIsPrimary a) (addIsPrimary b)) hosts
-  untilSuccess (connection rs Nothing) hosts'
+  untilSuccess (connection rs (Just cachedConn)) hosts'
 
-type ReplicaInfo = (Host, Document)
--- ^ Result of isMaster command on host in replica set. Returned fields are: setName, ismaster, secondary, hosts, [primary]. primary only present when ismaster = false
+type ReplicaInfo = ((Host, Pipe), Document)
+-- ^ The 'Document' is the result of @isMaster@ command on the 'Host' in replica set. Returned fields are: setName, ismaster, secondary, hosts, [primary]. primary only present when @ismaster = false@. The 'Pipe' used to reach the query host is stored so that it can be reused if necessary.
 
 statedPrimary :: ReplicaInfo -> Maybe Host
 -- ^ Primary of replica set or Nothing if there isn't one
-statedPrimary (host', info) = if (at "ismaster" info) then Just host' else readHostPort <$> B.lookup "primary" info
+statedPrimary ((cHost, _), info) = if (at "ismaster" info) then Just cHost else readHostPort <$> B.lookup "primary" info
 
 possibleHosts :: ReplicaInfo -> [Host]
 -- ^ Non-arbiter, non-hidden members of replica set
@@ -239,41 +237,39 @@ possibleHosts (_, info) = map readHostPort $ at "hosts" info
 updateMembers :: ReplicaSet -> IO ReplicaInfo
 -- ^ Fetch replica info from any server and update members accordingly
 updateMembers rs@(ReplicaSet _ vMembers _ _) = do
-    (host', info) <- untilSuccess (fetchReplicaInfo rs) =<< readMVar vMembers
-    modifyMVar vMembers $ \members -> do
-        let ((members', old), new) = intersection (map readHostPort $ at "hosts" info) members
-        forM_ old $ \(_, mPipe) -> maybe (return ()) close mPipe
-        return (members' ++ map (, Nothing) new, (host', info))
- where
-    intersection :: (Eq k) => [k] -> [(k, v)] -> (([(k, v)], [(k, v)]), [k])
-    intersection keys assocs = (partition (flip elem inKeys . fst) assocs, keys \\ inKeys) where
-        assocKeys = map fst assocs
-        inKeys = intersect keys assocKeys
+    rsinfo@(_, info) <- untilSuccess (fetchReplicaInfo rs) =<< readMVar vMembers
+    modifyMVar vMembers $ \prevMembers -> do
+        let curMembers = map readHostPort $ at "hosts" info
+            union = curMembers `List.union` prevMembers
+        -- we force the spine of the list to avoid
+        -- building a huge thunk inside the MVar
+        return $ length union `seq` (union, rsinfo)
 
-fetchReplicaInfo :: ReplicaSet -> (Host, Maybe Pipe) -> IO ReplicaInfo
--- Connect to host and fetch replica info from host creating new connection if missing or closed (previously failed). Fail if not member of named replica set.
-fetchReplicaInfo rs@(ReplicaSet rsName _ _ _) (host', mPipe) = do
-    pipe <- connection rs mPipe host'
+fetchReplicaInfo :: ReplicaSet -> Host -> IO ReplicaInfo
+-- Connect to host and fetch replica info from host creating new connection. Fail if not member of named replica set.
+fetchReplicaInfo rs@(ReplicaSet rsName _ _ _) host' = do
+    pipe <- connection rs Nothing host'
     info <- adminCommand ["isMaster" =: (1 :: Int)] pipe
     case B.lookup "setName" info of
         Nothing -> throwError $ userError $ show host' ++ " not a member of any replica set, including " ++ T.unpack rsName ++ ": " ++ show info
         Just setName | setName /= rsName -> throwError $ userError $ show host' ++ " not a member of replica set " ++ T.unpack rsName ++ ": " ++ show info
-        Just _ -> return (host', info)
+        Just _ -> return ((host', pipe), info)
 
-connection :: ReplicaSet -> Maybe Pipe -> Host -> IO Pipe
--- ^ Return new or existing connection to member of replica set. If pipe is already known for host it is given, but we still test if it is open.
-connection (ReplicaSet _ vMembers timeoutSecs transportSecurity) mPipe host' =
-    maybe conn (\p -> isClosed p >>= \bad -> if bad then conn else return p) mPipe
- where
-    conn =  modifyMVar vMembers $ \members -> do
-        let (Host h p) = host'
-        let conn' = case transportSecurity of 
-                        Secure   -> TLS.connect h p 
-                        Unsecure -> connect' timeoutSecs host'
-        let new = conn' >>= \pipe -> return (updateAssocs host' (Just pipe) members, pipe)
-        case List.lookup host' members of
-            Just (Just pipe) -> isClosed pipe >>= \bad -> if bad then new else return (members, pipe)
-            _ -> new
+connection :: ReplicaSet -> Maybe (Host, Pipe) -> Host -> IO Pipe
+-- ^ Return new or existing connection to member of replica set.
+-- If a pipe is already known for the desired host, we re-use it (but we still test if it is open).
+-- If a pipe is given, but it is not a pipe to the desired host, we close the given pipe and open a new one.
+connection (ReplicaSet _ _ timeoutSecs transportSecurity) mCachedConn host' = do
+    let (Host h p) = host'
+    let new = case transportSecurity of 
+                    Secure   -> TLS.connect h p 
+                    Unsecure -> connect' timeoutSecs host'
+    case mCachedConn of
+        Just (cHost, cPipe) ->
+            if cHost == host'
+                then isClosed cPipe >>= \bad -> if bad then new else return cPipe
+                else close cPipe >> new
+        Nothing -> new
 
 
 {- Authors: Tony Hannan <tony@10gen.com>
